@@ -1,0 +1,25 @@
+[Unit]
+Description=HP Omen Fan Control Daemon
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/omen-fand
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=5
+User=root
+PIDFile=/tmp/omen-fand.PID
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening (optional)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp /var/log/omen-fan /sys/kernel/debug/ec /sys/devices/platform/hp-wmi
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
