@@ -3,30 +3,56 @@
 import os
 import signal
 import sys
+import json
+import logging
 from time import sleep
-import tomlkit
 from bisect import bisect_left
 
 ECIO_FILE = "/sys/kernel/debug/ec/ec0/io"
 IPC_FILE = "/tmp/omen-fand.PID"
-CONFIG_FILE = "/etc/omen-fan/config.toml"
+CONFIG_FILE = "/etc/omen-fan/config.json"
+LOG_DIR = "/var/log/omen-fan"
 
-FAN1_OFFSET = 52  # 0x34
-FAN2_OFFSET = 53  # 0x35
-BIOS_OFFSET = 98  # 0x62
-TIMER_OFFSET = 99  # 0x63
-CPU_TEMP_OFFSET = 87  # 0x57
-GPU_TEMP_OFFSET = 183  # 0xB7
+FAN1_OFFSET = 52
+FAN2_OFFSET = 53
+BIOS_OFFSET = 98
+TIMER_OFFSET = 99
+CPU_TEMP_OFFSET = 87
+GPU_TEMP_OFFSET = 183
 
 FAN1_MAX = 55
 FAN2_MAX = 57
 
-with open(CONFIG_FILE, "r") as file:
-    doc = tomlkit.loads(file.read())
-    TEMP_CURVE = doc["service"]["TEMP_CURVE"].unwrap()
-    SPEED_CURVE = doc["service"]["SPEED_CURVE"].unwrap()
-    IDLE_SPEED = doc["service"]["IDLE_SPEED"].unwrap()
-    POLL_INTERVAL = doc["service"]["POLL_INTERVAL"].unwrap()
+DEFAULT_CONFIG = {
+    "service": {
+        "TEMP_CURVE": [50, 60, 70, 80, 87, 93],
+        "SPEED_CURVE": [20, 40, 60, 70, 85, 100],
+        "IDLE_SPEED": 0,
+        "POLL_INTERVAL": 1.0,
+        "TEMP_SMOOTHING": True,
+        "HYSTERESIS": 2
+    }
+}
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r") as file:
+            config = json.load(file)
+            merged_config = DEFAULT_CONFIG.copy()
+            if "service" in config:
+                merged_config["service"].update(config["service"])
+            return merged_config["service"]
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.warning(f"Config load failed, using defaults: {e}")
+        return DEFAULT_CONFIG["service"]
+
+config = load_config()
+TEMP_CURVE = config["TEMP_CURVE"]
+SPEED_CURVE = config["SPEED_CURVE"]
+IDLE_SPEED = config["IDLE_SPEED"]
+POLL_INTERVAL = config["POLL_INTERVAL"]
+TEMP_SMOOTHING = config["TEMP_SMOOTHING"]
+HYSTERESIS = config["HYSTERESIS"]
 
 # Precalculate slopes to reduce compute time.
 slope = []

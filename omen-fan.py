@@ -5,17 +5,21 @@ import subprocess
 import signal
 import sys
 import glob
+import json
+import logging
 from time import sleep
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import click
-import tomlkit
 from click_aliases import ClickAliasedGroup
 
 
 ECIO_FILE = "/sys/kernel/debug/ec/ec0/io"
 IPC_FILE = "/tmp/omen-fand.PID"
 DEVICE_FILE = "/sys/devices/virtual/dmi/id/product_name"
-CONFIG_FILE = "/etc/omen-fan/config.toml"
+CONFIG_FILE = "/etc/omen-fan/config.json"
+LOG_DIR = "/var/log/omen-fan"
 BOOST_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/pwm1_enable")[0]
 FAN1_SPEED_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/fan1_input")[0]
 FAN2_SPEED_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/fan2_input")[0]
@@ -29,6 +33,83 @@ BOOST_OFFSET = 236  # 0xEC
 FAN1_SPEED_MAX = 55
 FAN2_SPEED_MAX = 57
 DEVICE_LIST = ["OMEN by HP Laptop 16"]
+
+DEFAULT_CONFIG = {
+    "service": {
+        "TEMP_CURVE": [50, 60, 70, 80, 87, 93],
+        "SPEED_CURVE": [20, 40, 60, 70, 85, 100],
+        "IDLE_SPEED": 0,
+        "POLL_INTERVAL": 1.0,
+        "TEMP_SMOOTHING": True,
+        "HYSTERESIS": 2
+    },
+    "script": {
+        "BYPASS_DEVICE_CHECK": False
+    }
+}
+
+def setup_logging():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f"{LOG_DIR}/omen-fan.log"),
+                logging.StreamHandler()
+            ]
+        )
+    except PermissionError:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[logging.StreamHandler()]
+        )
+
+def load_config() -> dict:
+    if not os.path.isfile(CONFIG_FILE):
+        return DEFAULT_CONFIG.copy()
+    
+    try:
+        with open(CONFIG_FILE, "r") as file:
+            config = json.load(file)
+            merged_config = DEFAULT_CONFIG.copy()
+            for section in merged_config:
+                if section in config:
+                    merged_config[section].update(config[section])
+            return merged_config
+    except (json.JSONDecodeError, IOError) as e:
+        logging.error(f"Failed to load config: {e}")
+        return DEFAULT_CONFIG.copy()
+
+def save_config(config: dict):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, "w") as file:
+            json.dump(config, file, indent=2)
+    except IOError as e:
+        logging.error(f"Failed to save config: {e}")
+        raise
+
+def validate_config(config: dict) -> bool:
+    try:
+        service = config["service"]
+        temp_curve = service["TEMP_CURVE"]
+        speed_curve = service["SPEED_CURVE"]
+        
+        if len(temp_curve) != len(speed_curve):
+            raise ValueError("TEMP_CURVE and SPEED_CURVE must have same length")
+        
+        if not all(temp_curve[i] <= temp_curve[i + 1] for i in range(len(temp_curve) - 1)):
+            raise ValueError("TEMP_CURVE must be in ascending order")
+            
+        if not all(0 <= speed <= 100 for speed in speed_curve):
+            raise ValueError("SPEED_CURVE values must be between 0-100")
+            
+        return True
+    except (KeyError, ValueError) as e:
+        logging.error(f"Config validation failed: {e}")
+        return False
 
 
 def is_root(state=0):
@@ -44,54 +125,53 @@ def is_root(state=0):
 
 
 def startup_check():
+    setup_logging()
+    config = load_config()
+    
     if not os.path.isfile(CONFIG_FILE):
-        doc = tomlkit.document()
-        doc.add(tomlkit.comment("Created by omen-fan script"))
-
-        doc.add("service", tomlkit.table())
-        doc["service"]["TEMP_CURVE"] = [50, 60, 70, 80, 87, 93]
-        doc["service"]["SPEED_CURVE"] = [20, 40, 60, 70, 85, 100]
-        doc["service"]["IDLE_SPEED"] = 0
-        doc["service"]["POLL_INTERVAL"] = 1
-
-        doc.add("script", tomlkit.table())
-        doc["script"]["BYPASS_DEVICE_CHECK"] = 0
-
         if not is_root(1):
-            print("  WARNING: No config file present. Start as root to create.")
-            is_config = 0
+            logging.warning("No config file present. Start as root to create.")
         else:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, "w") as file:
-                file.write(tomlkit.dumps(doc))
-            print("  INFO: Configuration file has been created")
-            is_config = 1
-    else:
-        with open(CONFIG_FILE, "r") as file:
-            doc = tomlkit.loads(file.read())
-        is_config = 1
+            save_config(config)
+            logging.info("Configuration file has been created")
+    
+    if not validate_config(config):
+        logging.error("Invalid configuration, using defaults")
+        config = DEFAULT_CONFIG.copy()
+        if is_root(1):
+            save_config(config)
+    
+    return config
 
-    with open(DEVICE_FILE, "r") as device_file:
-        device_name = device_file.read()
-
-    if (
-        any(devices not in device_name for devices in DEVICE_LIST)
-        and doc["script"]["BYPASS_DEVICE_CHECK"] != 1
-    ):
-        print("  ERROR: Your laptop is not in the list of supported laptops")
-        print("         You may manually force the app to run at your own risk")
-
-        if is_config and is_root(1):
-            choice = input("Do you want to permanently disable this check? (y/N): ")
-            if choice.lower() == "y":
-                doc["script"]["BYPASS_DEVICE_CHECK"] = 1
-                with open(CONFIG_FILE, "w") as file:
-                    file.write(tomlkit.dumps(doc))
+def device_check():
+    config = load_config()
+    
+    try:
+        with open(DEVICE_FILE, "r") as device_file:
+            device_name = device_file.read().strip()
+        
+        if (not any(device in device_name for device in DEVICE_LIST) 
+            and not config["script"]["BYPASS_DEVICE_CHECK"]):
+            
+            logging.error("Your laptop is not in the list of supported laptops")
+            print("  ERROR: Your laptop is not in the list of supported laptops")
+            print("         You may manually force the app to run at your own risk")
+            
+            if is_root(1):
+                choice = input("Do you want to permanently disable this check? (y/N): ")
+                if choice.lower() == "y":
+                    config["script"]["BYPASS_DEVICE_CHECK"] = True
+                    save_config(config)
+                    logging.info("Device check bypassed permanently")
+                else:
+                    sys.exit(1)
             else:
+                print("  Root access required for override prompt.")
                 sys.exit(1)
-        else:
-            print("  Root access or config file is not present for override prompt.")
-            sys.exit(1)
+                
+    except IOError as e:
+        logging.error(f"Failed to read device file: {e}")
+        sys.exit(1)
 
 
 def load_ec_module():
@@ -205,41 +285,44 @@ def boost_cli(arg):
 )
 @click.option("--idle-speed", type=click.IntRange(0, 100), help="Idle fan speed value")
 @click.option("--poll-interval", type=click.FLOAT, help="Poll interval in seconds")
+@click.option("--temp-smoothing", type=bool, help="Enable temperature smoothing")
+@click.option("--hysteresis", type=click.IntRange(1, 10), help="Temperature hysteresis")
 @click.option("--view", is_flag=True, help="Show current config")
-def configure_cli(temp_curve, speed_curve, idle_speed, poll_interval, view):
+def configure_cli(temp_curve, speed_curve, idle_speed, poll_interval, temp_smoothing, hysteresis, view):
     is_root()
     
-    with open(CONFIG_FILE, "r") as file:
-        doc = tomlkit.loads(file.read())
+    config = load_config()
     
     if view:
-        print(tomlkit.dumps(doc))
+        print(json.dumps(config, indent=2))
         return
     
     if temp_curve:
         temp_curve = [int(x) for x in temp_curve.split(",")]
-    else:
-        temp_curve = doc["service"]["TEMP_CURVE"]
-
+        config["service"]["TEMP_CURVE"] = temp_curve
+    
     if speed_curve:
         speed_curve = [int(x) for x in speed_curve.split(",")]
-    else:
-        speed_curve = doc["service"]["SPEED_CURVE"]
-
+        config["service"]["SPEED_CURVE"] = speed_curve
 
     if idle_speed is not None:
-        doc["service"]["IDLE_SPEED"] = idle_speed
+        config["service"]["IDLE_SPEED"] = idle_speed
 
     if poll_interval is not None:
-        doc["service"]["POLL_INTERVAL"] = poll_interval
+        config["service"]["POLL_INTERVAL"] = poll_interval
+        
+    if temp_smoothing is not None:
+        config["service"]["TEMP_SMOOTHING"] = temp_smoothing
+        
+    if hysteresis is not None:
+        config["service"]["HYSTERESIS"] = hysteresis
 
-    if len(temp_curve) != len(speed_curve):
-        raise click.UsageError("TEMP_CURVE and SPEED_CURVE must have the same length")
-    if not all(temp_curve[i] <= temp_curve[i + 1] for i in range(len(temp_curve) - 1)):
-        raise click.UsageError("TEMP_CURVE must be in ascending order")
+    # Validate the configuration
+    if not validate_config(config):
+        raise click.UsageError("Invalid configuration values")
 
-    with open(CONFIG_FILE, "w") as file:
-        file.write(tomlkit.dumps(doc))
+    save_config(config)
+    print("  Configuration updated successfully")
 
 
 @cli.command(name="service", aliases=["e"], help="Start/Stop Fan management service")
