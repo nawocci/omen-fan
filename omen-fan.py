@@ -20,6 +20,23 @@ IPC_FILE = "/tmp/omen-fand.PID"
 DEVICE_FILE = "/sys/devices/virtual/dmi/id/product_name"
 CONFIG_FILE = "/etc/omen-fan/config.json"
 LOG_DIR = "/var/log/omen-fan"
+
+def get_hwmon_file(pattern: str, description: str) -> str:
+    try:
+        files = glob.glob(pattern)
+        if not files:
+            raise FileNotFoundError(f"No {description} file found with pattern: {pattern}")
+        return files[0]
+    except Exception as e:
+        logging.error(f"Failed to find {description}: {e}")
+        sys.exit(1)
+
+def get_hwmon_files():
+    global BOOST_FILE, FAN1_SPEED_FILE, FAN2_SPEED_FILE
+    if 'BOOST_FILE' not in globals():
+        BOOST_FILE = get_hwmon_file("/sys/devices/platform/hp-wmi/hwmon/*/pwm1_enable", "boost control")
+        FAN1_SPEED_FILE = get_hwmon_file("/sys/devices/platform/hp-wmi/hwmon/*/fan1_input", "fan1 speed")
+        FAN2_SPEED_FILE = get_hwmon_file("/sys/devices/platform/hp-wmi/hwmon/*/fan2_input", "fan2 speed")
 BOOST_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/pwm1_enable")[0]
 FAN1_SPEED_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/fan1_input")[0]
 FAN2_SPEED_FILE = glob.glob("/sys/devices/platform/hp-wmi/hwmon/*/fan2_input")[0]
@@ -111,6 +128,25 @@ def validate_config(config: dict) -> bool:
         logging.error(f"Config validation failed: {e}")
         return False
 
+def safe_ec_read(offset: int, default: int = 0) -> int:
+    try:
+        with open(ECIO_FILE, "rb") as ec:
+            ec.seek(offset)
+            return int.from_bytes(ec.read(1), "big")
+    except (IOError, OSError) as e:
+        logging.warning(f"EC read failed at offset {offset}: {e}")
+        return default
+
+def safe_ec_write(offset: int, value: int) -> bool:
+    try:
+        with open(ECIO_FILE, "r+b") as ec:
+            ec.seek(offset)
+            ec.write(bytes([int(value)]))
+        return True
+    except (IOError, OSError) as e:
+        logging.error(f"EC write failed at offset {offset}: {e}")
+        return False
+
 
 def is_root(state=0):
     if os.geteuid() != 0:
@@ -175,12 +211,21 @@ def device_check():
 
 
 def load_ec_module():
-    if "ec_sys" not in str(subprocess.check_output("lsmod")):
-        subprocess.run(["modprobe", "ec_sys", "write_support=1"], check=True)
+    try:
+        if "ec_sys" not in str(subprocess.check_output("lsmod")):
+            subprocess.run(["modprobe", "ec_sys", "write_support=1"], check=True)
+            logging.info("Loaded ec_sys module")
 
-    if not bool(os.stat(ECIO_FILE).st_mode & 0o200):
-        subprocess.run(["modprobe", "-r", "ec_sys"], check=True)
-        subprocess.run(["modprobe", "ec_sys", "write_support=1"], check=True)
+        if not bool(os.stat(ECIO_FILE).st_mode & 0o200):
+            subprocess.run(["modprobe", "-r", "ec_sys"], check=True)
+            subprocess.run(["modprobe", "ec_sys", "write_support=1"], check=True)
+            logging.info("Reloaded ec_sys module with write support")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to load EC module: {e}")
+        sys.exit(1)
+    except FileNotFoundError:
+        logging.error(f"EC file not found: {ECIO_FILE}")
+        sys.exit(1)
 
 
 def update_fan(speed1, speed2):
@@ -253,6 +298,7 @@ def cli():
 @click.argument("arg", type=bool)
 def bios_control_cli(arg):
     is_root()
+    device_check()
     load_ec_module()
     bios_control(arg)
 
@@ -261,7 +307,9 @@ def bios_control_cli(arg):
 @click.argument("arg", type=bool)
 def boost_cli(arg):
     is_root()
+    device_check()
     load_ec_module()
+    get_hwmon_files()
     if arg is False:
         with open(BOOST_FILE, "r+", encoding="utf-8") as file:
             file.write("2")
@@ -329,6 +377,7 @@ def configure_cli(temp_curve, speed_curve, idle_speed, poll_interval, temp_smoot
 @click.argument("arg", type=str)
 def service_cli(arg):
     is_root()
+    device_check()
     load_ec_module()
     if arg in ["start", "1"]:
         if os.path.isfile(IPC_FILE):
@@ -378,15 +427,19 @@ def info_cli():
         else:
             print("  BIOS Control : Unknown (Need root)")
 
-    with open(FAN1_SPEED_FILE, "r", encoding="utf-8") as fan1:
-        print(f"  Fan 1 : {fan1.read().strip()} RPM")
-    with open(FAN2_SPEED_FILE, "r", encoding="utf-8") as fan2:
-        print(f"  Fan 2 : {fan2.read().strip()} RPM")
+    try:
+        get_hwmon_files()
+        with open(FAN1_SPEED_FILE, "r", encoding="utf-8") as fan1:
+            print(f"  Fan 1 : {fan1.read().strip()} RPM")
+        with open(FAN2_SPEED_FILE, "r", encoding="utf-8") as fan2:
+            print(f"  Fan 2 : {fan2.read().strip()} RPM")
 
-    with open(BOOST_FILE, "r", encoding="utf-8") as boost:
-        if boost.read().strip() == "0":
-            print("\n  Fan Boost : Enabled")
-            print("  Fan speeds are now maxed. BIOS and User controls are ignored")
+        with open(BOOST_FILE, "r", encoding="utf-8") as boost:
+            if boost.read().strip() == "0":
+                print("\n  Fan Boost : Enabled")
+                print("  Fan speeds are now maxed. BIOS and User controls are ignored")
+    except Exception:
+        print("  Fan Status : Unable to read (hwmon not available)")
 
 
 @cli.command(
@@ -399,6 +452,7 @@ def info_cli():
 @click.argument("arg2", type=str, required=False)
 def set_cli(arg1, arg2):
     is_root()
+    device_check()
     load_ec_module()
     if os.path.isfile(IPC_FILE):
         print("  WARNING: omen-fan service running, may override fan speed")
