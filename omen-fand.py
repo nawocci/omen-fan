@@ -7,6 +7,8 @@ import json
 import logging
 from time import sleep
 from bisect import bisect_left
+from collections import deque
+from logging.handlers import RotatingFileHandler
 
 ECIO_FILE = "/sys/kernel/debug/ec/ec0/io"
 IPC_FILE = "/tmp/omen-fand.PID"
@@ -34,6 +36,19 @@ DEFAULT_CONFIG = {
     }
 }
 
+def setup_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handler = RotatingFileHandler(
+        f"{LOG_DIR}/omen-fand.log", 
+        maxBytes=1024*1024, 
+        backupCount=3
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[handler]
+    )
+
 def load_config():
     try:
         with open(CONFIG_FILE, "r") as file:
@@ -46,6 +61,22 @@ def load_config():
         logging.warning(f"Config load failed, using defaults: {e}")
         return DEFAULT_CONFIG["service"]
 
+class TemperatureFilter:
+    def __init__(self, window_size=5, hysteresis=2):
+        self.window = deque(maxlen=window_size)
+        self.hysteresis = hysteresis
+        self.last_speed = 0
+    
+    def smooth_temp(self, temp):
+        self.window.append(temp)
+        return sum(self.window) / len(self.window)
+    
+    def apply_hysteresis(self, new_speed):
+        if abs(new_speed - self.last_speed) < self.hysteresis:
+            return self.last_speed
+        self.last_speed = new_speed
+        return new_speed
+
 config = load_config()
 TEMP_CURVE = config["TEMP_CURVE"]
 SPEED_CURVE = config["SPEED_CURVE"]
@@ -53,6 +84,8 @@ IDLE_SPEED = config["IDLE_SPEED"]
 POLL_INTERVAL = config["POLL_INTERVAL"]
 TEMP_SMOOTHING = config["TEMP_SMOOTHING"]
 HYSTERESIS = config["HYSTERESIS"]
+
+temp_filter = TemperatureFilter(hysteresis=HYSTERESIS)
 
 # Precalculate slopes to reduce compute time.
 slope = []
@@ -113,6 +146,9 @@ def bios_control(enabled):
 
 signal.signal(signal.SIGTERM, sig_handler)
 
+setup_logging()
+logging.info("omen-fand starting up")
+
 with open(IPC_FILE, "w", encoding="utf-8") as ipc:
     ipc.write(str(os.getpid()))
 
@@ -120,22 +156,37 @@ speed_old = -1
 is_root()
 
 while True:
-    temp = get_temp()
+    try:
+        temp = get_temp()
+        
+        if TEMP_SMOOTHING:
+            temp = temp_filter.smooth_temp(temp)
 
-    if temp <= TEMP_CURVE[0]:
-        speed = IDLE_SPEED
-    elif temp >= TEMP_CURVE[-1]:
-        speed = SPEED_CURVE[-1]
-    else:
-        i = bisect_left(TEMP_CURVE, temp)
-        y0 = SPEED_CURVE[i - 1]
-        x0 = TEMP_CURVE[i - 1]
+        if temp <= TEMP_CURVE[0]:
+            speed = IDLE_SPEED
+        elif temp >= TEMP_CURVE[-1]:
+            speed = SPEED_CURVE[-1]
+        else:
+            i = bisect_left(TEMP_CURVE, temp)
+            y0 = SPEED_CURVE[i - 1]
+            x0 = TEMP_CURVE[i - 1]
+            speed = y0 + slope[i - 1] * (temp - x0)
 
-        speed = y0 + slope[i - 1] * (temp - x0)
+        speed = temp_filter.apply_hysteresis(speed)
 
-    if speed_old != speed:
-        speed_old = speed
-        update_fan(FAN1_MAX * speed / 100, FAN2_MAX * speed / 100)
+        if speed_old != speed:
+            speed_old = speed
+            fan1_speed = int(FAN1_MAX * speed / 100)
+            fan2_speed = int(FAN2_MAX * speed / 100)
+            update_fan(fan1_speed, fan2_speed)
+            logging.debug(f"Temp: {temp:.1f}°C, Speed: {speed:.1f}%, Fan1: {fan1_speed}, Fan2: {fan2_speed}")
 
-    bios_control(False)
-    sleep(POLL_INTERVAL)
+        bios_control(False)
+        sleep(POLL_INTERVAL)
+        
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt, shutting down")
+        break
+    except Exception as e:
+        logging.error(f"Unexpected error in main loop: {e}")
+        sleep(POLL_INTERVAL)
